@@ -89,17 +89,30 @@ if IS_WIN:
                           f"Win32 error {ctypes.get_last_error()}")
 
     def _read(h, off: int, n: int) -> bytes:
-        _seek(h, off)
-        buf = ctypes.create_string_buffer(n)
+        # Windows raw-device reads must be sector-aligned in offset AND length.
+        # Round both up, then slice off the tail.
+        if off % SECTOR:
+            base_off = (off // SECTOR) * SECTOR
+            delta = off - base_off
+        else:
+            base_off = off
+            delta = 0
+        want = n + delta
+        if want % SECTOR:
+            want = ((want + SECTOR - 1) // SECTOR) * SECTOR
+
+        _seek(h, base_off)
+        buf = ctypes.create_string_buffer(want)
         got = wintypes.DWORD(0)
-        if not _k32.ReadFile(h, buf, n, ctypes.byref(got), None):
-            raise OSError(f"ReadFile {off:#x}: "
+        if not _k32.ReadFile(h, buf, want, ctypes.byref(got), None):
+            raise OSError(f"ReadFile {base_off:#x}/{want}: "
                           f"Win32 error {ctypes.get_last_error()}")
-        return buf.raw[:got.value]
+        raw = buf.raw[:got.value]
+        return raw[delta:delta + n]
 
     def _write(h, off: int, data: bytes):
-        if len(data) % SECTOR:
-            raise ValueError(f"unaligned write ({len(data)} bytes)")
+        if off % SECTOR or len(data) % SECTOR:
+            raise ValueError(f"unaligned write: off={off:#x} len={len(data)}")
         _seek(h, off)
         buf = ctypes.create_string_buffer(data, len(data))
         got = wintypes.DWORD(0)
@@ -109,7 +122,7 @@ if IS_WIN:
         if got.value != len(data):
             raise OSError(f"short write at {off:#x}: "
                           f"{got.value}/{len(data)}")
-
+                          
     def _close(h):
         _k32.CloseHandle(h)
 
