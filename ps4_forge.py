@@ -15,6 +15,7 @@ Two primitives, one tool, one raw-I/O layer.
 
   --diagnose      read 0x6000..0x6080 and report. No writes.
   --scan          scan disk for section-table-like patterns. No writes.
+  --reset         offline + online the disk to clear a stuck volume stack.
 
 Shared primitives:
   --list          enumerate physical disks
@@ -28,6 +29,7 @@ Usage:
     python ps4_forge.py --list
     python ps4_forge.py --diagnose --disk 1
     python ps4_forge.py --scan --disk 1 --scan-end 0x200000
+    python ps4_forge.py --reset --disk 1
 
     python ps4_forge.py --mode record --payload payload.bin --no-write
     python ps4_forge.py --mode record --payload payload.bin --disk 1 --force
@@ -39,7 +41,7 @@ Usage:
                                     --table-off 0x100000 --disk 1 --force
 """
 
-import os, sys, json, struct, platform, subprocess, argparse
+import os, sys, json, struct, platform, subprocess, argparse, time
 from pathlib import Path
 from typing import Optional
 
@@ -88,9 +90,36 @@ if IS_WIN:
     _k32.CloseHandle.argtypes = [wintypes.HANDLE]
     _k32.CloseHandle.restype  = wintypes.BOOL
 
+    _k32.DeviceIoControl.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p]
+    _k32.DeviceIoControl.restype = wintypes.BOOL
+
+    FSCTL_LOCK_VOLUME            = 0x00090018
+    FSCTL_UNLOCK_VOLUME          = 0x0009001C
+    FSCTL_DISMOUNT_VOLUME        = 0x00090020
+    FSCTL_ALLOW_EXTENDED_DASD_IO = 0x00090083
+
     _GR, _GW = 0x80000000, 0x40000000
-    _OPEN_EXISTING, _SHARE_RW = 3, 3
+    _OPEN_EXISTING = 3
+    # FIX: include FILE_SHARE_DELETE (4) so other components don't block us.
+    _SHARE_RW = 1 | 2 | 4
     _INVALID = (1 << (8 * ctypes.sizeof(ctypes.c_void_p))) - 1
+
+    def _ioctl(h, code):
+        ret = wintypes.DWORD(0)
+        ok = _k32.DeviceIoControl(h, code, None, 0, None, 0,
+                                  ctypes.byref(ret), None)
+        return bool(ok)
+
+    def _lock_and_dismount(h):
+        """Acquire lock, dismount, allow extended DASD I/O on a raw handle."""
+        results = {}
+        results["extended"] = _ioctl(h, FSCTL_ALLOW_EXTENDED_DASD_IO)
+        results["lock"]     = _ioctl(h, FSCTL_LOCK_VOLUME)
+        results["dismount"] = _ioctl(h, FSCTL_DISMOUNT_VOLUME)
+        return results
 
     def _open(path, write):
         h = _k32.CreateFileW(
@@ -133,7 +162,13 @@ if IS_WIN:
         buf = ctypes.create_string_buffer(data, len(data))
         got = wintypes.DWORD(0)
         if not _k32.WriteFile(h, buf, len(data), ctypes.byref(got), None):
-            raise OSError(f"write {off:#x}: {ctypes.get_last_error()}")
+            err = ctypes.get_last_error()
+            if err == 21:
+                raise OSError(
+                    f"write {off:#x}: ERROR_NOT_READY (21). "
+                    f"Disk volume stack still live. "
+                    f"Run: python ps4_forge.py --reset --disk N")
+            raise OSError(f"write {off:#x}: Win32 {err}")
         if got.value != len(data):
             raise OSError(f"short write {got.value}/{len(data)}")
 
@@ -165,15 +200,80 @@ if IS_WIN:
             return []
 
     def dismount(n):
-        ps = (
-            f"$ErrorActionPreference='SilentlyContinue';"
-            f"Get-Partition -DiskNumber {n} | "
-            f"Where-Object {{$_.DriveLetter}} | ForEach-Object {{ "
-            f"Remove-PartitionAccessPath -DiskNumber {n} "
-            f"-PartitionNumber $_.PartitionNumber "
-            f"-AccessPath ($_.DriveLetter + ':') }}")
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+        ps = (f"$ErrorActionPreference='SilentlyContinue';"
+              f"Get-Partition -DiskNumber {n} | "
+              f"Where-Object {{$_.DriveLetter}} | "
+              f"Select-Object -ExpandProperty DriveLetter")
+        letters = []
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                 capture_output=True, text=True, timeout=10).stdout
+            letters = [x.strip() for x in out.split() if x.strip()]
+        except Exception:
+            pass
+
+        for letter in letters:
+            vol = f"\\\\.\\{letter}:"
+            try:
+                vh = _k32.CreateFileW(vol, _GR | _GW, _SHARE_RW,
+                                      None, _OPEN_EXISTING, 0, None)
+                hv = getattr(vh, "value", vh) or 0
+                if isinstance(hv, int) and hv < 0:
+                    hv += 1 << (8 * ctypes.sizeof(ctypes.c_void_p))
+                if hv == 0 or hv == _INVALID:
+                    continue
+                try:
+                    _ioctl(vh, FSCTL_LOCK_VOLUME)
+                    _ioctl(vh, FSCTL_DISMOUNT_VOLUME)
+                finally:
+                    _k32.CloseHandle(vh)
+            except Exception:
+                pass
+
+        ps2 = (f"$ErrorActionPreference='SilentlyContinue';"
+               f"Get-Partition -DiskNumber {n} | "
+               f"Where-Object {{$_.DriveLetter}} | ForEach-Object {{ "
+               f"Remove-PartitionAccessPath -DiskNumber {n} "
+               f"-PartitionNumber $_.PartitionNumber "
+               f"-AccessPath ($_.DriveLetter + ':') }}")
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps2],
                        capture_output=True, timeout=15)
+
+    def offline_disk(n):
+        """Take disk offline. Returns True on success or if already offline."""
+        ps = (f"$ErrorActionPreference='SilentlyContinue';"
+              f"$d = Get-Disk -Number {n};"
+              f"if ($d) {{ Set-Disk -Number {n} -IsOffline $true }};"
+              f"if ($?) {{ '1' }} else {{ '0' }}")
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                 capture_output=True, text=True, timeout=15).stdout
+            return out.strip().endswith("1")
+        except Exception:
+            return False
+
+    def online_disk(n):
+        """Bring disk back online. Returns True on success or if already online."""
+        ps = (f"$ErrorActionPreference='SilentlyContinue';"
+              f"$d = Get-Disk -Number {n};"
+              f"if ($d) {{ Set-Disk -Number {n} -IsOffline $false }};"
+              f"if ($?) {{ '1' }} else {{ '0' }}")
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                 capture_output=True, text=True, timeout=15).stdout
+            return out.strip().endswith("1")
+        except Exception:
+            return False
+
+    def disk_is_offline(n):
+        ps = (f"$d = Get-Disk -Number {n} -ErrorAction SilentlyContinue; "
+              f"if ($d) {{ $d.IsOffline }} else {{ 'unknown' }}")
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                 capture_output=True, text=True, timeout=10).stdout
+            return out.strip().lower() == "true"
+        except Exception:
+            return False
 
     def is_system_disk(n):
         ps = (f"$d = Get-Disk -Number {n} -ErrorAction SilentlyContinue; "
@@ -253,6 +353,15 @@ else:
     def dismount(n):
         pass
 
+    def offline_disk(n):
+        return True
+
+    def online_disk(n):
+        return True
+
+    def disk_is_offline(n):
+        return False
+
     def is_system_disk(n):
         return False
 
@@ -278,21 +387,38 @@ def find_file(name, explicit=None):
             return cand
     return None
 
-def read_file(path, required=True, label=""):
-    p = Path(path)
-    if not p.exists():
-        if required:
-            raise SystemExit(f"missing: {path}")
-        return None
-    data = p.read_bytes()
-    print(f"{label or 'file':<8}: {p} ({len(data):,} bytes)")
-    return data
-
 def pick_removable(disks):
     cand = [d for d in disks
             if "USB" in d.get("iface", "").upper()
             or d.get("media", "").lower().startswith("remov")]
     return cand or disks
+
+# =============================================================== reset
+
+def reset_disk(disk_index):
+    """Offline + online the disk to clear a stuck volume stack."""
+    if is_system_disk(disk_index):
+        print(f"refusing: disk {disk_index} hosts the system volume")
+        return 2
+
+    print(f"resetting PhysicalDrive{disk_index}")
+    print("  dismounting volumes...")
+    dismount(disk_index)
+    time.sleep(0.5)
+
+    print("  offlining...")
+    ok = offline_disk(disk_index)
+    print(f"    offline: {'OK' if ok else 'FAILED'}")
+    time.sleep(1.5)
+
+    print("  onlining...")
+    ok = online_disk(disk_index)
+    print(f"    online:  {'OK' if ok else 'FAILED'}")
+    time.sleep(1.0)
+
+    state = "offline" if disk_is_offline(disk_index) else "online"
+    print(f"  final state: {state}")
+    return 0
 
 # =============================================================== diagnose
 
@@ -440,7 +566,6 @@ def build_leak_entry(entry_size=None):
 # =============================================================== forge
 
 def forge_record(base: bytes, payload: bytes, body_off: int = BODY_OFF) -> bytes:
-    """Fahrenheit mode: patch len fields, overlay payload at body_off."""
     if base[LABEL_OFF:LABEL_OFF+len(LABEL)] != LABEL:
         raise SystemExit(f"base has no PS4 label at 0x{LABEL_OFF:X}")
     size = max(len(base), body_off + len(payload))
@@ -458,7 +583,6 @@ def forge_record(base: bytes, payload: bytes, body_off: int = BODY_OFF) -> bytes
 
 def forge_pfs(base: bytes, mode: str, payload: bytes,
               table_off: int, body_off: int, entry_size=None) -> bytes:
-    """pfs_forge mode: craft section table, optionally overlay payload."""
     if base[LABEL_OFF:LABEL_OFF+len(LABEL)] != LABEL:
         raise SystemExit(f"base has no PS4 label at 0x{LABEL_OFF:X}")
     size = max(len(base), body_off + len(payload), table_off + 0x400)
@@ -499,15 +623,44 @@ def write_image(disk_index, img, verify_table_off=None, entry_size=None):
     path = devpath(disk_index)
     print(f"target : {path}")
     print(f"image  : {len(img):,} bytes ({len(img)/1024/1024:.2f} MB)")
-    print("dismounting...")
-    dismount(disk_index)
 
+    # Step 1: dismount any volumes.
+    print("dismounting volumes...")
+    dismount(disk_index)
+    time.sleep(0.3)
+
+    # Step 2: take the disk offline (Windows only).
+    # This is what actually forces the storage stack to release the disk.
+    if IS_WIN:
+        print("offlining disk...")
+        offline_disk(disk_index)
+        time.sleep(1.0)
+        if disk_is_offline(disk_index):
+            print("  disk is offline")
+        else:
+            print("  WARN: disk is still online — write may fail with error 21")
+
+    # Step 3: open and lock the physical handle.
+    print("opening physical handle...")
     h = _open(path, True)
+    saved = None
     try:
-        saved = None
+        if IS_WIN:
+            res = _lock_and_dismount(h)
+            print(f"  lock={res['lock']} dismount={res['dismount']} "
+                  f"extended={res['extended']}")
+            # extended=False on a raw PhysicalDrive is normal; it's a
+            # volume-handle-only IOCTL. Do not warn about it.
+
         try:
             saved = _read(h, 0, SECTOR)
-            print(f"saved MBR sig {saved[510]:02x} {saved[511]:02x}")
+            sig = f"{saved[510]:02x} {saved[511]:02x}" if len(saved) >= 512 else "?"
+            print(f"saved MBR sig {sig}")
+            if len(saved) >= 512 and (saved[510] != 0x55 or saved[511] != 0xAA):
+                print("  WARN: MBR signature is not 55 AA. "
+                      "Drive is in a bad state.")
+                print("        Run: python ps4_forge.py --reset --disk N")
+                print("        Then retry the write.")
         except OSError as e:
             print(f"WARN: MBR readback: {e}")
 
@@ -520,7 +673,29 @@ def write_image(disk_index, img, verify_table_off=None, entry_size=None):
                 n = ((n + SECTOR - 1) // SECTOR) * SECTOR
                 if w + n > total:
                     n = total - w
-            _write(h, w, img[w:w+n])
+
+            last_err = None
+            for attempt in range(4):
+                try:
+                    _write(h, w, img[w:w+n])
+                    last_err = None
+                    break
+                except OSError as e:
+                    last_err = e
+                    if IS_WIN:
+                        try:
+                            _lock_and_dismount(h)
+                        except Exception:
+                            pass
+                    time.sleep(0.4 * (attempt + 1))
+            if last_err is not None:
+                if saved is not None:
+                    try:
+                        _write(h, 0, saved)
+                        print("  MBR restored after failure")
+                    except Exception:
+                        pass
+                raise last_err
             w += n
             print(f"  {w*100//total:3d}%  {w:,}/{total:,}")
 
@@ -528,7 +703,17 @@ def write_image(disk_index, img, verify_table_off=None, entry_size=None):
             _write(h, 0, saved)
             print("MBR restored")
     finally:
+        if IS_WIN:
+            try:
+                _ioctl(h, FSCTL_UNLOCK_VOLUME)
+            except Exception:
+                pass
         _close(h)
+        # Step 4: bring the disk back online so Windows can see it.
+        if IS_WIN:
+            print("onlining disk...")
+            online_disk(disk_index)
+            time.sleep(1.0)
 
     print("verifying...")
     h = _open(path, False)
@@ -560,39 +745,28 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode",
                     choices=["record", "loop", "leak", "payload", "all"],
-                    default="record",
-                    help="record = Fahrenheit-style metadata record merge; "
-                         "loop/leak/payload/all = PFS section-table forge")
-    ap.add_argument("--payload", default=None,
-                    help="payload.bin path (optional for record, optional "
-                         "for loop/leak, used for payload/all)")
-    ap.add_argument("--base", default=None,
-                    help="jm_real.bin path (required for any write)")
+                    default="record")
+    ap.add_argument("--payload", default=None)
+    ap.add_argument("--base", default=None)
     ap.add_argument("--disk", type=int, default=None)
-    ap.add_argument("--out", default=None,
-                    help="merged image output (default: merged_<mode>.bin)")
+    ap.add_argument("--out", default=None)
     ap.add_argument("--table-off", type=lambda x: int(x, 0),
-                    default=DEFAULT_TABLE_OFF,
-                    help="section table offset (pfs modes)")
+                    default=DEFAULT_TABLE_OFF)
     ap.add_argument("--body-off", type=lambda x: int(x, 0),
-                    default=BODY_OFF,
-                    help="payload overlay offset (record + all modes)")
+                    default=BODY_OFF)
     ap.add_argument("--entry-size", type=lambda x: int(x, 0),
-                    default=ENTRY_SIZE,
-                    help="section entry stride (default 0x38)")
-    ap.add_argument("--scan", action="store_true",
-                    help="scan for section-table patterns (read-only)")
-    ap.add_argument("--scan-end", type=lambda x: int(x, 0),
-                    default=0x200000)
-    ap.add_argument("--diagnose", action="store_true",
-                    help="read record region and report (read-only)")
+                    default=ENTRY_SIZE)
+    ap.add_argument("--scan", action="store_true")
+    ap.add_argument("--scan-end", type=lambda x: int(x, 0), default=0x200000)
+    ap.add_argument("--diagnose", action="store_true")
+    ap.add_argument("--reset", action="store_true",
+                    help="offline + online the disk to clear a stuck "
+                         "volume stack (no writes)")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--no-write", action="store_true")
-    ap.add_argument("--force", action="store_true",
-                    help="required for any device write")
+    ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
-    # -------- list --------------------------------------------------------
     if args.list:
         for d in list_disks():
             gb = d.get("size", 0) / (1024**3)
@@ -601,13 +775,16 @@ def main():
                   f"{d.get('path', devpath(d['index']))}  {d.get('model', '')}")
         return
 
-    # -------- diagnose ----------------------------------------------------
+    if args.reset:
+        if args.disk is None:
+            sys.exit("--reset requires --disk N")
+        sys.exit(reset_disk(args.disk))
+
     if args.diagnose:
         if args.disk is None:
             sys.exit("--diagnose requires --disk N")
         sys.exit(diagnose(args.disk))
 
-    # -------- scan --------------------------------------------------------
     if args.scan:
         if args.disk is None:
             sys.exit("--scan requires --disk N")
@@ -615,7 +792,6 @@ def main():
                                entry_size=args.entry_size)
         return
 
-    # -------- forge / write ----------------------------------------------
     if not args.no_write and not args.force:
         sys.exit("refusing to write without --force")
 
@@ -661,7 +837,6 @@ def main():
     if args.no_write:
         return
 
-    # -------- pick disk ---------------------------------------------------
     disks = list_disks()
     disk = args.disk
     if disk is None:
@@ -671,7 +846,6 @@ def main():
         disk = cand[0]["index"]
         print(f"auto-picked disk {disk}")
 
-    # -------- write -------------------------------------------------------
     ok = write_image(disk, img,
                      verify_table_off=table_for_verify,
                      entry_size=args.entry_size)
