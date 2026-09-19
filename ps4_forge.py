@@ -572,8 +572,8 @@ def forge_record(base: bytes, payload: bytes, body_off: int = BODY_OFF) -> bytes
     size = (size + SECTOR - 1) // SECTOR * SECTOR
     img = bytearray(size)
     img[:len(base)] = base
-    struct.pack_into("<Q", img, LEN_A_OFF, LEN_A_GOOD)
-    struct.pack_into("<Q", img, LEN_B_OFF, LEN_B_GOOD)
+#    struct.pack_into("<Q", img, LEN_A_OFF, LEN_A_GOOD)
+#    struct.pack_into("<Q", img, LEN_B_OFF, LEN_B_GOOD)
     if payload:
         end = min(len(img), body_off + len(payload))
         n = end - body_off
