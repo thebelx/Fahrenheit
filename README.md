@@ -217,7 +217,6 @@ The record is at `0x6000`. The walker bug is in `FUN_00ea1480`. The section tabl
 kiss my ass.
 
 
-— bel · [jb.0d01.wtf](https://jb.0d01.wtf) · [@belsploit](https://x.com/belsploit)
 
 
 # Now for the technical shit:
@@ -614,3 +613,384 @@ The practical consequence: any field whose value fails a check is used downstrea
 - Whether either bug fires on a retail console. Fahrenheit has no reachable call path from USB. The PFS walker needs a plaintext superblock and a console that accepts the drive.
 - Whether the PFS superblock is encrypted. Evidence is consistent with several explanations.
 - Whether 13.52 has the same PFS walker bug. The rodata and helper are byte-identical per the earlier finding, so it likely does, but I have not independently confirmed the walker code itself.
+
+
+
+Here’s a Discord-ready version, keeping the technical detail but formatting it so the headings, quotes, code, and tables render cleanly in Discord:
+
+# Fahrenheit FAQ
+
+> **"This is a jailbreak."**
+
+No.
+
+Fahrenheit is a **disk-side writer**. It places a crafted section table at a disk offset where `pfs_mount` may parse it.
+
+No working userland primitive has been demonstrated on 13.02 in this project. The chain has no first link as of the current artifacts.
+
+The tool cannot:
+
+- Execute code
+- Escalate privileges
+- Persist anything across a reboot
+- Turn a retail PS4 into a working jailbreak by itself
+
+It is a metadata editor with a diagnostic mode.
+
+---
+
+> **"But the README cites kernel bugs."**
+
+The kernel bugs are real, verified at the decompile level, and documented in the README. There are two:
+
+**1. 32-bit allocation wrap in `ffs_mountfs`**
+
+`FUN_00ae9510`, file offset `0x0046a510`.
+
+The multiply `fs_ncg * 4` is computed in 32 bits. If `fs_ncg > 0x3FFFFFFF`, it wraps and the allocation shrinks below what the write loop writes.
+
+The 13.52 decompile of the same function casts `fs_ncg` to `ulong` before the multiply. This is the same class of fix as FreeBSD `r308064`, which landed in stable/9.
+
+The vulnerable behavior is present in 13.02.
+
+**2. `stride=0` infinite loop in `pfs_mount`**
+
+`FUN_00ea1480`, file offset `0x00822480`.
+
+The section walker advances by `*(uint *)(entry + 0x0C)` per iteration. If that field is zero and the entry's ID is nonzero, the loop never advances.
+
+The branch executes the blk_bitmap handler on each iteration, which allocates an mbuf and a `0x200`-byte buffer, leaking both.
+
+Both are confirmed in the 13.02 kernel ELF.
+
+Neither is reachable from USB on a retail console without a prior userland primitive.
+
+> The existence of a kernel bug is not the same thing as having a complete exploit chain.
+
+---
+
+> **"The README reads like it was written in one night."**
+
+It was.
+
+Twice, actually.
+
+The first public iteration was a straight technical write-up. The version you're reading is the one with the receipts section appended after Sony's legal letter.
+
+The research behind it was **not** done in one night.
+
+The disk format was captured from a real PS4-formatted drive and cross-checked against a second drive.
+
+The kernel decompiles are Ghidra output against a public 13.02 ELF.
+
+Ghidra base for that image is `0x67F000`.
+
+To convert a Ghidra VA to a file offset:
+
+`VA - 0x67F000 = file offset`
+
+The FreeBSD 9 ancestry of the FFS allocation code is documented in the `ffs_vfsops.c` history.
+
+Anyone who wants to verify the arithmetic bug can diff the 13.02 and 13.52 decompiles themselves and compare the result against the FreeBSD source tree.
+
+---
+
+> **"It spoofs capacity to the PS4 UI."**
+
+No.
+
+The Extended Storage page reads `READ CAPACITY` from the USB bridge firmware through SCSI. It does **not** obtain the displayed capacity from an on-disk structure.
+
+Writing bytes at `0x6030` or `0x6038` therefore changes nothing that the console displays.
+
+This was verified twice on two drives. Both showed the capacity reported by the controller, unchanged regardless of what was written to the disk.
+
+The only way to change the reported capacity is to rewrite the controller firmware using the vendor's mass-production tool.
+
+---
+
+> **"It bypasses the 250 GB minimum."**
+
+Same layer, same answer.
+
+The gate is `READ CAPACITY` at the SCSI layer.
+
+A 62.9 GB stick with a perfect on-disk record is still rejected with `CE-41901-5` before the relevant disk content is parsed.
+
+The console reads the disk's label, decides the drive is extended-storage-shaped, and then applies the size check from the SCSI response.
+
+If the response is under 250 GB, the format button fails immediately.
+
+Nothing on disk changes the outcome.
+
+---
+
+> **"The PFS superblock transplant works."**
+
+No.
+
+The 8 KB superblock at disk offset `0x10000` is per-format randomized.
+
+Two consecutive formats of the **same drive** produce superblocks that differ at 8174 of 8192 bytes.
+
+The `0x5000`–`0x6000` region differs at 4078 of 4096 bytes.
+
+The label region at `0x6000` differs at 32 of 128 bytes.
+
+The transformation runs through the SBL service via `sceSblServiceMailbox` (`FUN_00e2f9f0`).
+
+The key material is staged at kernel global `0x2e6c000` before being handed off to the SBL mailbox interface.
+
+Whether the underlying key is fuse-burned in silicon or recoverable from disk is **unresolved in this work**.
+
+What is confirmed is that transplanting a superblock from one format onto another drive, or onto the same drive after a reformat, does **not** produce a mountable filesystem.
+
+---
+
+> **"The `ip_ctloutput` leak."**
+
+**Retracted.**
+
+The earlier claim that `FUN_ffffffff825a7a20` leaked uninitialized mbuf memory through an `IP_OPTIONS` getsockopt was based on a misidentification.
+
+The call site in that function invokes `FUN_ffffffff82302ad0` with four arguments, which is `sooptcopyin` — copying user data **into** the kernel, not the other way around.
+
+There is no leak in that function as decompiled.
+
+---
+
+> **"The `strlen` overread in `FUN_00bc6380`."**
+
+**Retracted.**
+
+The section-name comparison helper was claimed to overread because `param_3` (the length argument) was attacker-controlled.
+
+On re-reading the function, the loop terminates on a null byte in the **constant** argument (`"blk_bitmap"`, `"ino_bitmap"`, etc.), not on the attacker-controlled string.
+
+The constant is at most 18 bytes long.
+
+The maximum read from the attacker side is bounded by the constant's terminator, not by `param_3`.
+
+There is no overread.
+
+`FUN_00bc6380` is the address for the 13.02 dump (file offset `0x00547380`).
+
+---
+
+> **"Then why does the tool exist?"**
+
+Because the disk format was undocumented and now isn't.
+
+Because the write path works:
+
+- 16 MB written
+- Byte-verified
+- MBR preserved and restored
+- Section table confirmed by readback
+
+Because the kernel bugs are real and the decompiles are public.
+
+Because the tool has a diagnostic mode that reads and reports the on-disk state without modifying anything.
+
+It does exactly what it says it does.
+
+The README states this explicitly in the **"What this is not"** section.
+
+---
+
+> **"So how do you actually run this?"**
+
+The following workflow produces useful diagnostic data without requiring a console that accepts the drive.
+
+**1. Get a normal USB drive**
+
+Do not start with the target stick.
+
+Use a working reference drive. Ideally, use a real ≥250 GB USB 3.0 drive — one that the PS4 will actually accept and format as extended storage.
+
+If you don't have one, use any USB drive that has been formatted by a PS4 as extended storage at some point.
+
+The diagnostic will work on any drive that has the metadata label at `0x6000`.
+
+**2. Format it on the PS4**
+
+Format the drive on the PS4 as extended storage.
+
+The drive must be ≥250 GB as reported via SCSI.
+
+If it isn't, the console rejects the format with `CE-41901-5` before writing anything.
+
+On a smaller drive, `--diagnose` will still read the label at `0x6000` and report the current superblock state, but no format will complete.
+
+Let the console write its own metadata record and PFS superblock.
+
+**3. Dump it**
+
+```bash
+python ps4_forge.py --diagnose --disk N
+```
+
+The tool reads `0x6000` through `0x6080` and reports:
+
+* Whether the `PS4 External Storage Metadata R` label is present
+* The version field
+* Current `len_a` and `len_b`
+* The first 128 bytes of the body area
+
+If it prints:
+
+```text
+label: NOT FOUND in first 64 KB
+```
+
+the drive has never been formatted as extended storage on a PS4.
+
+Nothing to diagnose.
+
+**4. Merge without writing**
+
+If you have a payload you want to test:
+
+```bash
+python ps4_forge.py --mode record --payload payload.bin --base jm_real.bin --no-write
+```
+
+Produces:
+
+```text
+merged_record.bin
+```
+
+Open it in a hex editor alongside `jm_real.bin`.
+
+Only the length fields at `0x6030`/`0x6038` and the payload at `0x6040` onward should differ.
+
+**5. Write with `--force`**
+
+```bash
+python ps4_forge.py --mode record --payload payload.bin --base jm_real.bin --disk N --force
+```
+
+The tool:
+
+* Saves the MBR sector
+* Dismounts volumes
+* Takes the disk offline
+* Opens the raw handle
+* Writes the merged image
+* Restores the MBR
+* Brings the disk back online
+* Verifies the label and length fields
+
+`--force` is mandatory.
+
+Nothing writes without it.
+
+**6. The result**
+
+The drive will now contain the merged image.
+
+Inserting it into a PS4 will **not** mount it as extended storage.
+
+The tool writes disk bytes; it does not change SCSI capacity, and it does not produce a PFS superblock that the console can decrypt.
+
+What it produces is a disk image that can be examined, compared against other captures, and used as evidence for the format documentation.
+
+---
+
+> **"What was actually established?"**
+
+| Finding                                  | Status                                                                                 |
+| ---------------------------------------- | -------------------------------------------------------------------------------------- |
+| Metadata label at `0x6000`               | Verified, identical across three drives                                                |
+| `len_a` / `len_b` at `0x6030` / `0x6038` | Verified, not read by SCSI check                                                       |
+| PFS superblock at `0x10000`              | Verified, per-format randomized                                                        |
+| MBR at `0x0`                             | Ciphertext on PS4-formatted drives; boot code on Windows-formatted drives              |
+| SBL call chain                           | `pfs_mount` → `pfs_dec_sub` → `FUN_00e2ad00` → `FUN_00e2f9f0` → `sceSblServiceMailbox` |
+| FFS allocation wrap (13.02)              | Confirmed, fixed in 13.52 by `ulong` cast                                              |
+| PFS walker `stride=0` loop               | Confirmed in decompile                                                                 |
+| `FUN_00ae0450` behavior                  | Non-fatal logger; every "invalid X" check logs and continues                           |
+| Capacity display source                  | SCSI `READ CAPACITY` from USB bridge firmware                                          |
+| 250 GB gate source                       | Same                                                                                   |
+| Superblock transplant                    | Non-portable across formats                                                            |
+
+---
+
+> **"What is open?"**
+
+| Question                                                                       | Why it matters                                                                                                           |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| Is the SBL key material fuse-burned or on-disk?                                | Determines whether superblocks can be forged                                                                             |
+| Is the PFS section table in the decrypted plaintext, or inside the ciphertext? | Determines whether the `stride=0` loop is reachable                                                                      |
+| Is there a `mount(2, ..., "ufs", ...)` path on retail 13.02?                   | Determines whether Fahrenheit is reachable outside of the internal HDD path                                              |
+| Is the drive-bound randomization seeded by a value on disk?                    | The label region contains 32 bytes that change per format; if those are the seed, the transformation may be reproducible |
+| What does userland pass to `pfs_mount` as `eekpfs`?                            | Determines whether the encryption key material is caller-supplied or console-supplied                                    |
+
+---
+
+> **"Where to look."**
+
+**Disk format**
+
+```text
+0x6000     label, version, length fields, body
+0x10000    superblock, 8 KB, per-format randomized
+0xD0000000 backup superblock region (unverified)
+```
+
+**13.02 kernel**
+
+```text
+FUN_00ae9510   ffs_mountfs
+               file offset: 0x0046a510
+
+FUN_00ae7130   ffs_mount
+               file offset: 0x0046a130
+
+FUN_00ea1480   pfs_mount
+               file offset: 0x00822480
+
+FUN_00e26770   pfs_dec_sub
+               file offset: 0x00823770
+
+FUN_00e2ad00   key material staging
+               file offset: 0x00827d00
+
+FUN_00e2b0c0   key handle manager
+               file offset: 0x008280c0
+
+FUN_00e2f9f0   sceSblServiceMailbox wrapper
+               file offset: 0x0082c9f0
+
+FUN_00bc6380   section-name comparison
+               file offset: 0x00547380
+```
+
+All offsets are derived from the Ghidra base `0x67F000`.
+
+---
+
+> **"So what is Fahrenheit, actually?"**
+
+Fahrenheit is a **PS4 disk-format research and metadata-writing tool**.
+
+It documents a format that was previously undocumented and confirms two kernel bugs at the decompile level.
+
+It does **not** currently provide a working jailbreak.
+
+Neither confirmed kernel bug has been demonstrated as reachable from USB on a retail 13.02 console.
+
+The open questions are exactly that: **open questions**, not hidden claims of a working exploit.
+
+If you want to argue about whether it's real, run:
+
+```bash
+python ps4_forge.py --diagnose
+```
+
+on a PS4-formatted extended-storage drive and inspect the results yourself.
+
+Nothing here requires trusting the author.
+
+— bel · [jb.0d01.wtf](https://jb.0d01.wtf) · [@belsploit](https://x.com/belsploit)
+
