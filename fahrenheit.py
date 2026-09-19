@@ -65,7 +65,17 @@ if IS_WIN:
     def _open(path: str, write: bool):
         acc = _GR | (_GW if write else 0)
         h = _k32.CreateFileW(path, acc, _SHARE_RW, None, _OPEN_EXISTING, 0, None)
-        if not h or h.value == _INVALID_HANDLE:
+        # Python 3.13/3.14 may return int, older versions return HANDLE.
+        # Normalize to a signed integer for the invalid-value check.
+        if hasattr(h, "value"):
+            hval = h.value
+        else:
+            hval = h
+        if hval is None:
+            hval = 0
+        if isinstance(hval, int) and hval < 0:
+            hval += 1 << (8 * ctypes.sizeof(ctypes.c_void_p))
+        if hval == 0 or hval == _INVALID_HANDLE:
             err = ctypes.get_last_error()
             raise OSError(f"CreateFile {path}: Win32 error {err} "
                           f"(run elevated, close HxD and Disk Management)")
